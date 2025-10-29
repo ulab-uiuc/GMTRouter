@@ -1,0 +1,24 @@
+dataset:
+  name: mt_bench    # [chatbot_arena, gsm8k, mmlu, mt_bench]
+  path: ./data      # Root of all datasets 
+
+config:
+  preprocess: True  # True if <dataset.path>/<dataset.name>/<type>.pt exists
+
+train:
+
+  id: sample
+
+  epochs: 350
+  lr: 5e-4
+  record_per_user: 10
+  prediction_count: 256
+  multi_turn: False
+  aggregation_type: mean
+  objective: auc
+
+  seed: 136
+
+checkpoint:
+  root: ./models
+  save_every: 25

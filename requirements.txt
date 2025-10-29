@@ -1,0 +1,5 @@
+transformers>=4.43,<5
+scikit-learn>=1.3,<2
+PyYAML>=6,<7
+tqdm>=4.66,<5
+numpy>=1.24,<3
