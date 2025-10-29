@@ -333,7 +333,7 @@ def train_with_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     # Data locations
     base_dir = f"{cfg['dataset']['path'].rstrip('/')}/{cfg['dataset']['name']}"
-    train_jsonl = f"{base_dir}/train.jsonl"
+    train_jsonl = f"{base_dir}/training_set.jsonl"
     train_pt = f"{base_dir}/train.pt"
 
     # Build/load graph tensors & metadata
@@ -384,7 +384,7 @@ def train_with_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     best_ckpt_path = os.path.join(ckpt_dir, f"{cfg['dataset']['name']}_best_model.pt")
 
     # Validation
-    val_jsonl = os.path.join(base_dir, "valid.jsonl")
+    val_jsonl = os.path.join(base_dir, "valid_set.jsonl")
     if not os.path.isfile(val_jsonl):
         val_jsonl = None
 
@@ -452,7 +452,7 @@ def train_with_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         print(f"[FINAL] Loaded best epoch {ckpt.get('epoch', '?')} {metric.upper()}={ckpt.get('score', 0):.4f}")
 
     # Final test: prefer test.pt, fallback to test.jsonl
-    test_jsonl = os.path.join(base_dir, "test.jsonl")
+    test_jsonl = os.path.join(base_dir, "test_set.jsonl")
     test_pt = os.path.join(base_dir, "test.pt")
 
     print("\n[TEST] Running final evaluation...")
@@ -473,7 +473,7 @@ def train_with_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
         test_metrics = evaluate_jsonl(test_jsonl, predictor, full_train_emb, user_dict, llm_dict, device, verbose=True)
         print(f"[TEST-jsonl] acc={test_metrics['acc']:.4f} | auc={test_metrics['auc']:.4f}")
     else:
-        print("[TEST] No test.jsonl or test.pt found; skipping.")
+        print("[TEST] No test_set.jsonl or test.pt found; skipping.")
 
     return {
         "model": model,
