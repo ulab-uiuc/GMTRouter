@@ -16,7 +16,9 @@ train:
   multi_turn: False
   aggregation_type: mean
   objective: auc
+  binary: True
 
+  eval_every: 5
   seed: 136
 
 checkpoint:

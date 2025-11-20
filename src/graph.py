@@ -37,36 +37,51 @@ class PreferencePredictor(nn.Module):
         super().__init__()
         self.user_proj = nn.Linear(dim, hidden_dim)
         self.query_proj = nn.Linear(dim, hidden_dim)
-        self.llm_proj = nn.Linear(dim, hidden_dim)
+        self.llm_proj  = nn.Linear(dim, hidden_dim)
 
-        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
+        )
 
         self.out = nn.Sequential(
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, 1)
+            nn.Linear(hidden_dim * 2, 1),
         )
 
-    def forward(self, user, query, llm):
-        # Shape: [D] → [1, D]
-        user = user.unsqueeze(0)
-        query = query.unsqueeze(0)
-        llm = llm.unsqueeze(0)
+    def forward(self, user: torch.Tensor, query: torch.Tensor, llm: torch.Tensor) -> torch.Tensor:
+        """
+        user:  [D]
+        query: [D]
+        llm:   [D] OR [M, D]
 
-        u = self.user_proj(user)     # [1, H]
-        q = self.query_proj(query)   # [1, H]
-        l = self.llm_proj(llm)       # [1, H]
+        Returns:
+            logits: scalar if llm is [D], or [M] if llm is [M, D]
+        """
+        if llm.dim() == 1:
+            # Single LLM case -> promote to [1, D]
+            llm = llm.unsqueeze(0)
 
-        # Combine user + query as context: [1, 2, H]
-        context = torch.stack([u, q], dim=1)
-        target = l.unsqueeze(1)  # [1, 1, H]
+        assert user.dim() == 1 and query.dim() == 1 and llm.dim() == 2, \
+            f"Shapes must be user[q]=[D], llm=[M,D] (after promote). Got: user={tuple(user.shape)}, query={tuple(query.shape)}, llm={tuple(llm.shape)}"
 
-        # Apply attention: llm attends to user+query
-        attended, _ = self.cross_attn(query=target, key=context, value=context)  # [1, 1, H]
-        attended = attended.squeeze(1)  # [1, H]
+        M, D = llm.shape
 
-        # Concatenate attended context and llm for final prediction
-        x = torch.cat([attended, l], dim=-1)  # [1, 2H]
-        return self.out(x).squeeze()          # scalar
+        # project
+        u = self.user_proj(user.unsqueeze(0))    # [1, H]
+        q = self.query_proj(query.unsqueeze(0))  # [1, H]
+        l = self.llm_proj(llm)                   # [M, H]
 
+        # build context for each of the M LLMs: [M, 2, H]
+        context = torch.stack([u.expand(M, -1), q.expand(M, -1)], dim=1)  # [M,2,H]
+        target  = l.unsqueeze(1)                                           # [M,1,H]
 
+        # cross attention: llm attends to user+query
+        attended, _ = self.cross_attn(query=target, key=context, value=context)  # [M,1,H]
+        attended = attended.squeeze(1)  # [M,H]
+
+        # concat attended context with llm proj
+        x = torch.cat([attended, l], dim=-1)  # [M, 2H]
+        logits = self.out(x).squeeze(-1)      # [M]
+
+        return logits if M > 1 else logits.squeeze()  # scalar if original single-LLM path
