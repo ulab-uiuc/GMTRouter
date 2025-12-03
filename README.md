@@ -1,12 +1,9 @@
 # GMTRouter: Personalized LLM Router Over Multi-turn User Interactions
 
 <p align="center">
-    <a href="https://ulab-uiuc.github.io/GMTRouter/">
+    <a href="https://github.com/ulab-uiuc/GMTRouter/tree/main">
         <img alt="Build" src="https://img.shields.io/badge/Project-Page-blue">
     </a>
-    <!-- <a href=>
-        <img alt="Build" src=>
-    </a> -->
     <a href="https://github.com/ulab-uiuc/GMTRouter/blob/master/LICENSE">
         <img alt="License" src="https://img.shields.io/badge/LICENSE-MIT-green">
     </a>
@@ -24,12 +21,10 @@
 
 
 <p align="center">
-    <a href="https://ulab-uiuc.github.io/GMTRouter/">🌐 Project Page</a> |
+    <a href="https://github.com/ulab-uiuc/GMTRouter/tree/main">🌐 Project Page</a> |
     <a href=>📜 arXiv</a> 
 <p>
 
-
-<!-- ![Method](./figures/model.png) -->
 
 <div align="center">
   <img src="./figures/pipeline.png" width="700" alt="GoR">
@@ -38,7 +33,8 @@
 
 
 ## News
-**[2025.10.24]** 🌟 The **GMTRouter** paper is now available on arXiv: [url]
+**[2025.10.28]** 🌟 The **GMTRouter** repository is now open-sourced, and the paper will be publicly available on arXiv shortly.
+
 
 
 ## 📌Preliminary
@@ -74,27 +70,17 @@ pip install torch-geometric==2.6.1
 
 ### Dataset Preparation
 
-The processed datasets used in our experiments are already hosted in this repository via **Git LFS**.  
-They have been unified into a consistent format and split into **training**, **validation**, and **test** sets.
+The datasets used in our experiments have been processed into a unified format and split into **training**, **validation**, and **test** sets.
 
-You can obtain the data in two ways:
-
-**Option 1 — Clone directly via Git:**
-
-The datasets will be automatically downloaded via Git LFS during cloning.
-
-**Option 2 — Download manually from Google Drive:**
-
-You can also download the dataset archive directly from the following link:
+You can download the data manually from Google Drive via the following link:
 [Download from Google Drive](https://drive.google.com/uc?export=download&id=1l-sAXV7i08S9sjJw1_UyvD0mP56QSIKt)
 
-After downloading, decompress the archive **`GMTRouter_dataset.tar.gz`** and move the contents of the extracted **`data`** folder into the repository’s **`data/`** directory:
+After downloading, decompress the archive **`GMTRouter_dataset.tar.gz`** and move the extracted **`data`** folder to the root directory of the repository:
 
 ```bash
 tar -xzvf GMTRouter_dataset.tar.gz
-mv GMTRouter_dataset/data/* ./data/
+mv GMTRouter_dataset/data <destination_path>  # Replace <destination_path> with the root directory of this project
 ```
-
 
 ## ⭐Experiments
 
@@ -124,7 +110,7 @@ You can modify it to fit your own experimental setup or dataset.
 
 
 
-## Citation
+<!-- ## Citation
 
 ```bibtex
 @inproceedings{Xie2025GMTRouter,
@@ -132,10 +118,5 @@ You can modify it to fit your own experimental setup or dataset.
   author={Xie, Encheng and Sun, Yihang and Feng, Tao and You, Jiaxuan},
   year={2025}
 }
-```
+``` -->
 
-
-<!-- <picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ulab-uiuc%2FGraphEval&theme=dark&type=Date">
-<img width="100%" src="https://api.star-history.com/svg?repos=ulab-uiuc%2FGraphEval&type=Date">
-</picture> -->

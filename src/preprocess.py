@@ -10,6 +10,8 @@ def main():
     base_dir = args.base_dir
     dataset = args.dataset
     build_config(f"{base_dir}/{dataset}/training_set.jsonl", ckpt_path=f"{base_dir}/{dataset}/training_set.pt")
+    build_config(f"{base_dir}/{dataset}/valid_set.jsonl", ckpt_path=f"{base_dir}/{dataset}/valid_set.pt")
+    build_config(f"{base_dir}/{dataset}/test_set.jsonl", ckpt_path=f"{base_dir}/{dataset}/test_set.pt")
 
 if __name__ == "__main__":
     main()

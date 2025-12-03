@@ -1,5 +1,5 @@
 dataset:
-  name: LaMP    # [chatbot_arena, gsm8k, mmlu, mt_bench. LaMP]
+  name: mt_bench    # [chatbot_arena, gsm8k, mmlu, mt_bench]
   path: ./data      # Root of all datasets 
 
 config:
@@ -16,6 +16,7 @@ train:
   multi_turn: False
   aggregation_type: mean
   objective: auc
+  binary: True
 
   eval_every: 5
   seed: 136

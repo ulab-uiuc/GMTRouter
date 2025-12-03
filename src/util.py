@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import random
+from itertools import combinations
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -33,7 +34,18 @@ def _default_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# --- Enumerations ---
+# Global cache for sampling metadata, keyed by id(metadata).
+# Each entry stores a pair: (metadata_list, user_to_entries).
+_METADATA_INDEX_CACHE: Dict[
+    int,
+    Tuple[
+        List[Tuple[InteractionUnit, InteractionUnit]],
+        Dict[int, List[Tuple[InteractionUnit, InteractionUnit]]],
+    ],
+] = {}
+
+
+# --- Enums ---
 
 class EmbInit(str, Enum):
     ZEROS = "zero"
@@ -70,8 +82,7 @@ class HeteroEdges(Tuple[str, str, str], Enum):
 
 @dataclass
 class HeteroFeature:
-    """Container for dataset statistics and the corresponding feature tensors."""
-
+    """Container for dataset sizes and core feature tensors used in the heterograph."""
     num_users: int
     num_sessions: int
     num_queries: int
@@ -91,15 +102,19 @@ class HeteroFeature:
     plm_name: Optional[str] = None
     plm_encode: Optional[EncodeFn] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for k in ("num_users", "num_sessions", "num_queries", "num_responses", "num_llms"):
             v = getattr(self, k)
             if not isinstance(v, int) or v <= 0:
                 raise ValueError(f"{k} must be a positive int, got {v}")
         if not (isinstance(self.query_emb, torch.Tensor) and self.query_emb.shape == (self.num_queries, self.emb_dim)):
-            raise ValueError(f"query_emb must be [{self.num_queries}, {self.emb_dim}], got {tuple(self.query_emb.shape)}")
+            raise ValueError(
+                f"query_emb must be [{self.num_queries}, {self.emb_dim}], got {tuple(self.query_emb.shape)}"
+            )
         if not (isinstance(self.llm_plm_emb, torch.Tensor) and self.llm_plm_emb.shape == (self.num_llms, self.emb_dim)):
-            raise ValueError(f"llm_plm_emb must be [{self.num_llms}, {self.emb_dim}], got {tuple(self.llm_plm_emb.shape)}")
+            raise ValueError(
+                f"llm_plm_emb must be [{self.num_llms}, {self.emb_dim}], got {tuple(self.llm_plm_emb.shape)}"
+            )
 
     def _tinfo(self, t: Optional[torch.Tensor]) -> str:
         return "None" if t is None else f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}"
@@ -108,23 +123,38 @@ class HeteroFeature:
         if isinstance(val, torch.Tensor):
             ok = (val.dim() == 2 and val.size(0) == rows and val.size(1) == self.emb_dim)
             shape = tuple(val.shape)
-            return f"Tensor[{shape}, dtype={val.dtype}, device={val.device}]{'' if ok else ' (mismatch!)'}"
+            suffix = "" if ok else " (mismatch!)"
+            return f"Tensor[{shape}, dtype={val.dtype}, device={val.device}]{suffix}"
         return f"init={val.value}"
 
     def summary(self) -> str:
-        enc_name = getattr(self.plm_encode, "__name__", self.plm_encode.__class__.__name__) if self.plm_encode else None
-        return "\n".join([
-            "HeteroFeatureConfig(",
-            f"  counts: users={self.num_users}, sessions={self.num_sessions}, queries={self.num_queries}, responses={self.num_responses}, llms={self.num_llms}",
-            f"  emb_dim={self.emb_dim}",
-            f"  user_emb:    {self._init_info(self.user_emb, self.num_users)}",
-            f"  session_emb: {self._init_info(self.session_emb, self.num_sessions)}",
-            f"  query_emb:   {self._tinfo(self.query_emb)}",
-            f"  response_emb:{self._init_info(self.response_emb, self.num_responses)}",
-            f"  llm_plm_emb: {self._tinfo(self.llm_plm_emb)}",
-            f"  plm: name='{self.plm_name}', encode={enc_name}",
-            ")"
-        ])
+        if self.plm_encode is None:
+            enc_name = None
+        else:
+            enc_name = getattr(self.plm_encode, "__name__", self.plm_encode.__class__.__name__)
+        return "\n".join(
+            [
+                "HeteroFeatureConfig(",
+                (
+                    "  counts: users={u}, sessions={s}, queries={q}, "
+                    "responses={r}, llms={l}"
+                ).format(
+                    u=self.num_users,
+                    s=self.num_sessions,
+                    q=self.num_queries,
+                    r=self.num_responses,
+                    l=self.num_llms,
+                ),
+                f"  emb_dim={self.emb_dim}",
+                f"  user_emb:    {self._init_info(self.user_emb, self.num_users)}",
+                f"  session_emb: {self._init_info(self.session_emb, self.num_sessions)}",
+                f"  query_emb:   {self._tinfo(self.query_emb)}",
+                f"  response_emb:{self._init_info(self.response_emb, self.num_responses)}",
+                f"  llm_plm_emb: {self._tinfo(self.llm_plm_emb)}",
+                f"  plm: name='{self.plm_name}', encode={enc_name}",
+                ")",
+            ]
+        )
 
     __repr__ = __str__ = summary
 
@@ -132,21 +162,33 @@ class HeteroFeature:
 # --- PLM encoding ---
 
 def make_plm_encode(plm_name: str) -> Callable[[List[str]], torch.Tensor]:
-    """Construct a mean-pooled Hugging Face encoder mapping texts to [batch_size, hidden_dim] float32 tensors."""
+    """
+    Construct a mean-pooled Hugging Face encoder.
+
+    The returned function maps a list of texts to a tensor of shape [batch_size, hidden_dim]
+    with dtype float32.
+    """
     device = _default_device()
     tokenizer = AutoTokenizer.from_pretrained(plm_name)
     model = AutoModel.from_pretrained(plm_name).to(device).eval()
 
     def encode_fn(texts: List[str]) -> torch.Tensor:
         with torch.no_grad():
-            toks = tokenizer(texts, max_length=512, padding=True, truncation=True, return_tensors="pt")
+            toks = tokenizer(
+                texts,
+                max_length=512,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
             toks = {k: v.to(device) for k, v in toks.items()}
             out = model(**toks)
-            hidden = out.last_hidden_state                   # [B,T,H]
-            attn = toks["attention_mask"].bool()             # [B,T]
-            hidden = hidden.masked_fill(~attn[..., None], 0) # mask padding
+            hidden = out.last_hidden_state                   # Shape: [batch_size, sequence_length, hidden_dim].
+            attn = toks["attention_mask"].bool()             # Shape: [batch_size, sequence_length].
+            hidden = hidden.masked_fill(~attn[..., None], 0) # Mask out padding positions.
             denom = attn.sum(dim=1, keepdim=True).clamp_min(1)
             return (hidden.sum(dim=1) / denom).to(dtype=DTYPE)
+
     return encode_fn
 
 
@@ -157,9 +199,9 @@ def add_edge(
     edge_type: HeteroEdges,
     src: Optional[int],
     dst: Optional[int],
-    weight: Optional[float] = None
+    weight: Optional[float] = None,
 ) -> None:
-    """Append a directed edge (src → dst) to the buffer if both node indices are valid."""
+    """Append an edge (src → dst) to the edge bag if both indices are valid."""
     if src is None or dst is None:
         return
     edges_bag[edge_type].append((src, dst, weight))
@@ -173,10 +215,12 @@ def build_interaction_edges(
     prev_s2_idx: Optional[int],
 ) -> None:
     """
-    Add edges corresponding to a pair of interactions.
+    Add edges for a pair of interactions.
 
-    This includes session-to-user edges, query/LLM/response-to-session edges,
-    and optional temporal links to previous sessions.
+    This includes:
+    - Session → user edges.
+    - Query / response / LLM → session edges.
+    - Temporal edges linking to previous sessions when available.
     """
     u1, s1, q1, m1, r1 = interaction1
     u2, s2, q2, m2, r2 = interaction2
@@ -198,28 +242,30 @@ def build_interaction_edges(
 
 def build_graph_edges(
     edges_bag: EdgeBag,
-    device: torch.device
+    device: torch.device,
 ) -> EdgeIndexDict:
-    """Convert in-memory edge triplets into PyTorch Geometric `edge_index` tensors of shape [2, num_edges] on the specified device."""
+    """
+    Convert edge triplets into PyTorch edge_index tensors of shape [2, num_edges],
+    placed on the specified device.
+    """
     edge_index_dict: EdgeIndexDict = {}
     for etype, triples in edges_bag.items():
         if not triples:
             continue
         src, dst, _ = zip(*triples)
-        edge_index_dict[etype] = torch.stack(
-            (
-                torch.tensor(src, dtype=torch.long, device=device),
-                torch.tensor(dst, dtype=torch.long, device=device),
-            ),
-            dim=0,
-        )
+        src_tensor = torch.tensor(src, dtype=torch.long, device=device)
+        dst_tensor = torch.tensor(dst, dtype=torch.long, device=device)
+        edge_index_dict[etype] = torch.stack((src_tensor, dst_tensor), dim=0)
     return edge_index_dict
 
 
 # --- Edge views / session helpers ---
 
 def _as_edges_dict(graph: Union[HeteroData, EdgeIndexDict]) -> EdgeIndexDict:
-    """Return a mapping from `HeteroEdges` to `edge_index` tensors given a `HeteroData` object or an existing dictionary."""
+    """
+    Return a mapping {HeteroEdges: edge_index} from either a HeteroData instance
+    or an existing EdgeIndexDict.
+    """
     if isinstance(graph, HeteroData):
         out: EdgeIndexDict = {}
         for et in graph.edge_types:
@@ -227,7 +273,7 @@ def _as_edges_dict(graph: Union[HeteroData, EdgeIndexDict]) -> EdgeIndexDict:
             if ei is None:
                 continue
             try:
-                et_enum = HeteroEdges(et)  # ('src','rel','dst') -> enum
+                et_enum = HeteroEdges(et)  # Convert ('src', 'rel', 'dst') to the corresponding enum.
             except ValueError:
                 continue
             out[et_enum] = ei
@@ -236,7 +282,11 @@ def _as_edges_dict(graph: Union[HeteroData, EdgeIndexDict]) -> EdgeIndexDict:
 
 
 def build_prev_session_map(graph: Union[HeteroData, EdgeIndexDict]) -> Dict[int, int]:
-    """Construct a mapping from the current session index to the previous session index using `S2S1` edges."""
+    """
+    Build a mapping from current_session → previous_session using S2S1 edges.
+
+    If no S2S1 edges are present, an empty dictionary is returned.
+    """
     edges = _as_edges_dict(graph)
     s2s1 = edges.get(HeteroEdges.S2S1)
     if s2s1 is None:
@@ -252,9 +302,10 @@ def build_visible_edges(
     device: torch.device,
 ) -> EdgeIndexDict:
     """
-    Build an `edge_index` dictionary restricted to a set of visible interaction pairs.
+    Construct an edge_index dictionary for a set of visible interactions.
 
-    When `multi_turn` is True, previous sessions are linked only if they are also part of the sampled set.
+    When multi_turn is True, previous sessions are linked if they are also visible.
+    Otherwise, only per-interaction edges are added without temporal links.
     """
     visible_edges_bag: EdgeBag = defaultdict(list)
 
@@ -264,7 +315,8 @@ def build_visible_edges(
 
         for i1, i2 in visible_list:
             s1, s2 = i1[1], i2[1]
-            p1, p2 = prev_of.get(s1), prev_of.get(s2)
+            p1 = prev_of.get(s1)
+            p2 = prev_of.get(s2)
             prev_s1_idx = p1 if (p1 is not None and p1 in sampled_sessions) else None
             prev_s2_idx = p2 if (p2 is not None and p2 in sampled_sessions) else None
             build_interaction_edges(visible_edges_bag, i1, i2, prev_s1_idx, prev_s2_idx)
@@ -277,20 +329,50 @@ def build_visible_edges(
 
 # --- JSONL parsing/building ---
 
-def parse_jsonl_pairs(path: str) -> Iterator[Tuple[dict, dict]]:
-    """Yield consecutive pairs of JSON objects `(entry1, entry2)` from a JSONL file."""
-    with open(path, "r", encoding="utf-8") as f:
-        it = iter(f)
-        for line1 in it:
-            line2 = next(it, None)
-            if line2 is None:
-                break
-            yield json.loads(line1), json.loads(line2)
-
-
-def build_nodes_from_pairs(pairs: Iterator[Tuple[dict, dict]]):
+def parse_jsonl_groups(path: str) -> Iterator[List[dict]]:
     """
-    Construct node dictionaries, feature matrices, rating vectors, edge buffers, and metadata from paired JSON entries.
+    Yield consecutive groups of entries from a JSONL file.
+
+    Each group has length ≥ 2 and shares the same (question_id, turn, judge).
+    """
+    loads = json.loads
+    with open(path, "r", encoding="utf-8") as f:
+        group: List[dict] = []
+        key = None
+        for line in f:
+            e = loads(line)
+            # Raises KeyError intentionally if any required key is missing.
+            curr = (e["question_id"], e["turn"], e["judge"])
+            if key is None:
+                key = curr
+                group = [e]
+                continue
+            if curr == key:
+                group.append(e)
+            else:
+                assert len(group) >= 2, f"Group size <2 for key={key}"
+                yield group
+                key = curr
+                group = [e]
+        if group:
+            assert len(group) >= 2, f"Group size <2 for key={key}"
+            yield group
+
+
+def parse_jsonl_pairs(path: str) -> Iterator[Tuple[dict, dict]]:
+    """
+    Backward-compatible parser that expands each group into all 2-combinations
+    of entries.
+    """
+    for g in parse_jsonl_groups(path):
+        for a, b in combinations(g, 2):
+            yield a, b
+
+
+def build_nodes_from_groups(groups: Iterator[List[dict]]):
+    """
+    Build node dictionaries, embeddings, ratings, edges, and metadata
+    from grouped JSONL entries.
     """
     users: Dict[int, str] = {}
     llms: Dict[int, str] = {}
@@ -306,72 +388,130 @@ def build_nodes_from_pairs(pairs: Iterator[Tuple[dict, dict]]):
 
     edges_buffer: EdgeBag = defaultdict(list)
     metadata: Set[Tuple[InteractionUnit, InteractionUnit]] = set()
+    meta_add = metadata.add
+    add_interaction_edges = build_interaction_edges
 
     plm_name: Optional[str] = None
     session_cnt = 0
 
-    for e1, e2 in pairs:
-        assert e1["question_id"] == e2["question_id"], \
-            f'Inconsistent jsonl structure: mismatch question ID: {e1["question_id"]} vs {e2["question_id"]}'
-        assert e1["turn"] == e2["turn"], \
-            f'Inconsistent jsonl structure with number of turns mismatch: {e1["turn"]} - {e2["turn"]}'
+    for g in groups:
+        # Check basic invariants (these should already be guaranteed by the parser).
+        qids = {e["question_id"] for e in g}
+        turns = {e["turn"] for e in g}
+        judges = {e["judge"] for e in g}
+        assert len(qids) == len(turns) == len(judges) == 1, "Group invariants violated"
 
-        u1 = e1["judge"]; u2 = e2["judge"]
-        assert u1 == u2, f'Inconsistent jsonl structure with user name mismatch: {u1} - {u2}'
-        u_idx = user_to_idx.get(u1)
+        u_name = g[0]["judge"]
+        u_idx = user_to_idx.get(u_name)
         if u_idx is None:
-            u_idx = len(user_to_idx); user_to_idx[u1] = u_idx; users[u_idx] = u1
+            u_idx = len(user_to_idx)
+            user_to_idx[u_name] = u_idx
+            users[u_idx] = u_name
 
-        l1 = e1["model"]; l2 = e2["model"]
-        if l1 not in llm_to_idx:
-            idx = len(llm_to_idx); llm_to_idx[l1] = idx; llms[idx] = l1; llm_emb.append(e1["model_emb"])
-        if l2 not in llm_to_idx:
-            idx = len(llm_to_idx); llm_to_idx[l2] = idx; llms[idx] = l2; llm_emb.append(e2["model_emb"])
-        m1 = llm_to_idx[l1]; m2 = llm_to_idx[l2]
+        # Compute LLM identifiers for this group.
+        m_idx_list: List[int] = []
+        for e in g:
+            m_name = e["model"]
+            mid = llm_to_idx.get(m_name)
+            if mid is None:
+                mid = len(llm_to_idx)
+                llm_to_idx[m_name] = mid
+                llms[mid] = m_name
+                llm_emb.append(e["model_emb"])
+            m_idx_list.append(mid)
 
-        prev1: Optional[int] = None
-        prev2: Optional[int] = None
-        for t1, t2 in zip(e1["conversation"], e2["conversation"]):
-            s1 = session_cnt; s2 = session_cnt + 1; session_cnt += 2
-            q1 = len(query_emb); q2 = q1 + 1
-            queries[q1] = t1["query"]; queries[q2] = t2["query"]
-            query_emb.extend([t1["query_emb"], t2["query_emb"]])
-            r1 = len(responses); r2 = r1 + 1
-            responses[r1] = t1.get("response", "None")
-            responses[r2] = t2.get("response", "None")
-            ratings.append(float(t1["rating"])); ratings.append(float(t2["rating"]))
+        # Conversation turns must all have the same length across models in the group.
+        conv_lists = [e["conversation"] for e in g]
+        lengths = {len(c) for c in conv_lists}
+        assert len(lengths) == 1, f"Conversation length mismatch in group (judge={u_name})"
 
-            i1 = (u_idx, s1, q1, m1, r1)
-            i2 = (u_idx, s2, q2, m2, r2)
-            metadata.add((i1, i2))
-            build_interaction_edges(edges_buffer, i1, i2, prev1, prev2)
-            prev1, prev2 = s1, s2
+        # Track the previous session identifier for each model track.
+        prev_s: List[Optional[int]] = [None] * len(g)
 
-        if plm_name is None and "encoder" in e1:
-            plm_name = e1["encoder"]
+        for step in zip(*conv_lists):  # One tuple per turn, length == len(g).
+            # Build interactions per model for this turn.
+            interactions: List[InteractionUnit] = []
+            for j, t in enumerate(step):
+                s = session_cnt
+                session_cnt += 1
 
-    return users, llms, queries, responses, query_emb, llm_emb, ratings, metadata, edges_buffer, plm_name, session_cnt
+                q = len(query_emb)
+                queries[q] = t["query"]
+                query_emb.append(t["query_emb"])
+
+                r = len(responses)
+                responses[r] = t.get("response", "None")
+                ratings.append(float(t["rating"]))
+
+                m = m_idx_list[j]
+                i: InteractionUnit = (u_idx, s, q, m, r)
+                interactions.append(i)
+
+                # Add per-interaction edges and temporal edges within this model track.
+                # This adds S2U, Q2S, L2S, R2S, and S2S1 edges.
+                add_interaction_edges(edges_buffer, i, i, prev_s[j], prev_s[j])
+                prev_s[j] = s
+
+            # Add pairwise metadata for this turn (all 2-combinations of interactions).
+            for a, b in combinations(interactions, 2):
+                meta_add((a, b))
+
+        if plm_name is None and "encoder" in g[0]:
+            plm_name = g[0]["encoder"]
+
+    return (
+        users,
+        llms,
+        queries,
+        responses,
+        query_emb,
+        llm_emb,
+        ratings,
+        metadata,
+        edges_buffer,
+        plm_name,
+        session_cnt,
+    )
 
 
 # --- Helpers ---
 
 def _normalize_ratings(r_score: List[float], device: torch.device) -> torch.Tensor:
-    """Apply min–max normalization to the provided ratings and return a tensor of shape [num_ratings, 1] in the range [0, 1]."""
+    """
+    Apply min–max normalization to a list of ratings.
+
+    Returns a tensor of shape [num_ratings, 1] with values scaled into [0, 1].
+    """
     x = torch.tensor(r_score, dtype=DTYPE, device=device).unsqueeze(-1)
-    return (x - x.min()) / (x.max() - x.min() + 1e-8)
+    x_min = x.min()
+    x_max = x.max()
+    return (x - x_min) / (x_max - x_min + 1e-8)
 
 
 # --- Build from JSONL ---
 
 def build_config_from_jsonl(path: str):
     """
-    Build tensors, dictionaries, graph edges, and configuration objects from a JSONL file.
+    Build tensors and dictionaries from a JSONL file.
 
-    Returns (config, nodes, edges, user_dict, query_dict, response_dict, ratings, llm_dict, metadata, device).
+    Returns:
+        A tuple (config, nodes, edge_index_dict, users, queries, responses,
+        ratings, llms, metadata, device).
     """
     device = _default_device()
-    (users, llms, queries, responses, q_emb, l_emb, r_score,
-     meta, edge_buf, plm, sess_n) = build_nodes_from_pairs(parse_jsonl_pairs(path))
+    (
+        users,
+        llms,
+        queries,
+        responses,
+        q_emb,
+        l_emb,
+        r_score,
+        meta,
+        edge_buf,
+        plm,
+        sess_n,
+    ) = build_nodes_from_groups(parse_jsonl_groups(path))
 
     assert sess_n > 0, "Empty dataset."
     emb_dim = len(q_emb[0])
@@ -390,7 +530,7 @@ def build_config_from_jsonl(path: str):
         "session": x_session,
         "response": x_response,
         "query": x_query,
-        "llm": x_llm
+        "llm": x_llm,
     }
 
     config = HeteroFeature(
@@ -420,7 +560,7 @@ def build_config_from_jsonl(path: str):
         ratings,
         llms,
         meta,
-        device
+        device,
     )
 
 
@@ -428,20 +568,30 @@ def build_config_from_jsonl(path: str):
 
 def build_config(path: str, ckpt_path: str = None):
     """
-    Construct the configuration and graph structures from a JSONL file (with optional checkpoint saving)
-    or load them from an existing checkpoint.
+    Build configuration from a JSONL file (and optionally save a checkpoint)
+    or load an existing checkpoint from disk.
     """
     device = _default_device()
 
+    # JSONL → fresh build (optionally save to a checkpoint).
     if path.endswith(JSONL_SUFFIX):
         dataset_name = os.path.basename(os.path.dirname(path))
         result = build_config_from_jsonl(path)
-        (config, nodes, edge_index_dict,
-         user_dict, query_dict, response_dict,
-         ratings, llm_dict, metadata, device) = result
+        (
+            config,
+            nodes,
+            edge_index_dict,
+            user_dict,
+            query_dict,
+            response_dict,
+            ratings,
+            llm_dict,
+            metadata,
+            device,
+        ) = result
 
         if ckpt_path is not None:
-            # If `ckpt_path` ends with `.pt`, treat it as a file path; otherwise treat it as a directory.
+            # If ckpt_path ends with ".pt", treat it as a file path; otherwise, treat it as a directory.
             if ckpt_path.endswith(".pt"):
                 save_path = ckpt_path
                 os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
@@ -449,31 +599,34 @@ def build_config(path: str, ckpt_path: str = None):
                 os.makedirs(ckpt_path, exist_ok=True)
                 save_path = os.path.join(ckpt_path, f"{dataset_name}.pt")
 
-            torch.save({
-                "version": "v1",
-                "config": {
-                    "num_users": config.num_users,
-                    "num_sessions": config.num_sessions,
-                    "num_queries": config.num_queries,
-                    "num_responses": config.num_responses,
-                    "num_llms": config.num_llms,
-                    "emb_dim": config.emb_dim,
-                    "plm_name": config.plm_name,
-                    "aggregation_type": config.aggregation_type,
+            torch.save(
+                {
+                    "version": "v1",
+                    "config": {
+                        "num_users": config.num_users,
+                        "num_sessions": config.num_sessions,
+                        "num_queries": config.num_queries,
+                        "num_responses": config.num_responses,
+                        "num_llms": config.num_llms,
+                        "emb_dim": config.emb_dim,
+                        "plm_name": config.plm_name,
+                        "aggregation_type": config.aggregation_type,
+                    },
+                    "nodes": {k: v.cpu() for k, v in nodes.items()},
+                    "edges": {etype.name: v.cpu() for etype, v in edge_index_dict.items()},
+                    "user_dict": user_dict,
+                    "query_dict": query_dict,
+                    "response_dict": response_dict,
+                    "llm_dict": llm_dict,
+                    "metadata": list(metadata),
+                    "ratings": ratings.cpu(),
                 },
-                "nodes": {k: v.cpu() for k, v in nodes.items()},
-                "edges": {etype.name: v.cpu() for etype, v in edge_index_dict.items()},
-                "user_dict": user_dict,
-                "query_dict": query_dict,
-                "response_dict": response_dict,
-                "llm_dict": llm_dict,
-                "metadata": list(metadata),
-                "ratings": ratings.cpu(),
-            }, save_path)
+                save_path,
+            )
 
         return result
 
-    # Load branch remains unchanged.
+    # Load branch: restore tensors from a checkpoint.
     if os.path.isdir(path):
         dataset_name = os.path.basename(os.path.normpath(path))
         ckpt_file = os.path.join(path, f"{dataset_name}.pt")
@@ -487,6 +640,9 @@ def build_config(path: str, ckpt_path: str = None):
     cfg = ckpt["config"]
 
     nodes: NodeDict = {k: v.to(device) for k, v in ckpt["nodes"].items()}
+    plm_name = cfg["plm_name"]
+    plm_encode = make_plm_encode(plm_name) if plm_name is not None else None
+
     config = HeteroFeature(
         num_users=cfg["num_users"],
         num_sessions=cfg["num_sessions"],
@@ -496,19 +652,28 @@ def build_config(path: str, ckpt_path: str = None):
         query_emb=nodes["query"],
         llm_plm_emb=nodes["llm"],
         emb_dim=cfg["emb_dim"],
-        plm_name=cfg["plm_name"],
-        plm_encode=(make_plm_encode(cfg["plm_name"]) if cfg["plm_name"] is not None else None),
+        plm_name=plm_name,
+        plm_encode=plm_encode,
         aggregation_type=cfg["aggregation_type"],
     )
 
-    edges: EdgeIndexDict = {HeteroEdges[name]: v.to(device) for name, v in ckpt["edges"].items()}
+    edges: EdgeIndexDict = {
+        HeteroEdges[name]: v.to(device) for name, v in ckpt["edges"].items()
+    }
     metadata = set(tuple(map(tuple, x)) for x in ckpt["metadata"])
     ratings = ckpt["ratings"].to(device)
 
     return (
-        config, nodes, edges,
-        ckpt["user_dict"], ckpt["query_dict"], ckpt["response_dict"],
-        ratings, ckpt["llm_dict"], metadata, device,
+        config,
+        nodes,
+        edges,
+        ckpt["user_dict"],
+        ckpt["query_dict"],
+        ckpt["response_dict"],
+        ratings,
+        ckpt["llm_dict"],
+        metadata,
+        device,
     )
 
 
@@ -519,54 +684,84 @@ def sample_metadata(
     visible_count: int = 256,
     predict_count: int = 32,
     min_record_per_user: int = 10,
-    seed: int = None
+    seed: int = None,
 ) -> Tuple[List[Tuple[InteractionUnit, InteractionUnit]], List[Tuple[InteractionUnit, InteractionUnit]]]:
     """
-    Partition the metadata set into visible and prediction subsets while enforcing a per-user minimum.
+    Split metadata into visible and prediction subsets while enforcing a per-user minimum.
 
-    Returns a tuple `(visible_list, predict_list)` of interaction pairs.
+    The function ensures that each user has at least `min_record_per_user` entries in the
+    visible set before filling up the remaining slots and drawing a prediction subset.
     """
     rnd = random.Random(seed)
-    metadata_list = list(metadata)
-    total = len(metadata_list)
-    assert visible_count + predict_count <= total, \
-        f"visible_count({visible_count}) + predict_count({predict_count}) > total({total})"
+    rnd_sample = rnd.sample
+    rnd_shuffle = rnd.shuffle
 
-    user_to_entries: defaultdict[int, List[Tuple[InteractionUnit, InteractionUnit]]] = defaultdict(list)
-    for e in metadata_list:
-        user_to_entries[e[0][0]].append(e)
+    meta_id = id(metadata)
+    cached = _METADATA_INDEX_CACHE.get(meta_id)
+    if cached is None:
+        # First time this metadata object is seen: build and cache the index.
+        metadata_list = list(metadata)
+        user_to_entries: defaultdict[int, List[Tuple[InteractionUnit, InteractionUnit]]] = defaultdict(list)
+        for e in metadata_list:
+            user_to_entries[e[0][0]].append(e)
+        _METADATA_INDEX_CACHE[meta_id] = (metadata_list, user_to_entries)
+    else:
+        metadata_list, user_to_entries = cached
+
+    total = len(metadata_list)
+    assert visible_count + predict_count <= total, (
+        f"visible_count({visible_count}) + predict_count({predict_count}) > total({total})"
+    )
 
     visible_set = set()
     pool: List[Tuple[InteractionUnit, InteractionUnit]] = []
+
+    # Enforce per-user minimum in the visible set.
     for u, entries in user_to_entries.items():
         if len(entries) < min_record_per_user:
-            raise AssertionError(f"User {u} has only {len(entries)} records < min_record_per_user={min_record_per_user}")
-        sampled = rnd.sample(entries, min_record_per_user)
+            raise AssertionError(
+                f"User {u} has only {len(entries)} records < min_record_per_user={min_record_per_user}"
+            )
+        sampled = rnd_sample(entries, min_record_per_user)
         visible_set.update(sampled)
         pool.extend(x for x in entries if x not in sampled)
 
     visible_list = list(visible_set)
-    if len(visible_list) > visible_count:
-        rnd.shuffle(visible_list)
+    vis_len = len(visible_list)
+
+    if vis_len > visible_count:
+        rnd_shuffle(visible_list)
         overflow = visible_list[visible_count:]
         visible_list = visible_list[:visible_count]
         pool.extend(overflow)
-    elif len(visible_list) < visible_count:
-        need = visible_count - len(visible_list)
+    elif vis_len < visible_count:
+        need = visible_count - vis_len
         if len(pool) < need:
             raise AssertionError("Not enough pool entries to reach visible_count.")
-        rnd.shuffle(pool)
+        rnd_shuffle(pool)
         visible_list += pool[:need]
         pool = pool[need:]
 
-    remaining = pool if len(pool) >= predict_count else (pool + [e for e in metadata_list if e not in visible_set and e not in pool])
+    # Build the prediction pool.
+    if len(pool) >= predict_count:
+        remaining = pool
+    else:
+        pool_set = set(pool)
+        remaining = pool + [
+            e for e in metadata_list
+            if e not in visible_set and e not in pool_set
+        ]
+
     assert len(remaining) >= predict_count, "Not enough remaining entries to sample prediction set."
-    predict_list = rnd.sample(remaining, predict_count)
+    predict_list = rnd_sample(remaining, predict_count)
     return visible_list, predict_list
 
 
 def build_hetero_data(nodes: NodeDict, edge_index_dict: EdgeIndexDict) -> HeteroData:
-    """Instantiate a PyTorch Geometric `HeteroData` object from node feature tensors and edge indices."""
+    """
+    Create a PyTorch Geometric HeteroData object from node feature tensors
+    and a dictionary of edge_index tensors.
+    """
     data = HeteroData()
     for ntype, x in nodes.items():
         data[ntype].x = x
